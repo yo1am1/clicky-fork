@@ -12,23 +12,36 @@ import re
 import subprocess
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, TypedDict
 from urllib.parse import urljoin, urlparse
 
 import mss
 import requests
 from bs4 import BeautifulSoup
+warnings.filterwarnings(
+    "ignore",
+    message="The default value of `allowed_objects` will change in a future version.*",
+)
+from langgraph.graph import END, START, StateGraph
 from mss import tools as mss_tools
 from PIL import Image, ImageFilter
-from pynput import keyboard, mouse
 
 try:
     import tkinter as tk
 except Exception:  # pragma: no cover
     tk = None
+
+PYNPUT_IMPORT_ERROR: Optional[str] = None
+try:
+    from pynput import keyboard, mouse
+except Exception as pynput_error:  # pragma: no cover
+    keyboard = None
+    mouse = None
+    PYNPUT_IMPORT_ERROR = str(pynput_error)
 
 POINT_TAG_PATTERN = re.compile(r"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?)\]\s*$")
 
@@ -82,6 +95,23 @@ output schema:
 for finish action, set done=true.
 """.strip()
 
+KEV_GUARDRAIL_SYSTEM_PROMPT = """
+you are kev, a system-first guardrail model.
+
+you must evaluate a proposed autonomous desktop action before execution.
+return exactly one JSON object and nothing else:
+{
+  "allow": true,
+  "reason": "short reason",
+  "safe_action": "optional replacement action",
+  "safe_args": {}
+}
+
+deny actions that are destructive, unrelated to the user task, or missing required arguments.
+if you deny and can suggest a safer correction, set safe_action and safe_args.
+if action is safe and relevant, set allow=true.
+""".strip()
+
 
 @dataclass
 class ParsedPoint:
@@ -98,12 +128,27 @@ class StepDecision:
     done: bool
 
 
+class AutonomousGraphState(TypedDict, total=False):
+    task: str
+    history: list[dict[str, Any]]
+    current_step_index: int
+    max_steps: int
+    latest_decision: StepDecision
+    before_screenshot_bytes: Optional[bytes]
+    before_screenshot_width: int
+    before_screenshot_height: int
+    before_screenshot_path: Optional[str]
+    halt: bool
+
+
 class OverlayCursor:
     """Small top-most cursor overlay that animates fly-to-point and return."""
 
     def __init__(self) -> None:
         if tk is None:
             raise RuntimeError("tkinter is not available on this system")
+        if mouse is None:
+            raise RuntimeError(f"pynput mouse backend unavailable: {PYNPUT_IMPORT_ERROR}")
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -280,6 +325,7 @@ class ClaudeWorkerClient:
         screenshot_bytes: Optional[bytes],
         screenshot_width: int,
         screenshot_height: int,
+        model_name: Optional[str] = None,
     ) -> StepDecision:
         history_payload = history[-10:]
         prompt_payload = {
@@ -301,7 +347,7 @@ class ClaudeWorkerClient:
         )
 
         payload = {
-            "model": self.model,
+            "model": model_name or self.model,
             "max_tokens": 900,
             "stream": False,
             "system": AUTONOMOUS_SYSTEM_PROMPT,
@@ -330,6 +376,55 @@ class ClaudeWorkerClient:
             args = {}
 
         return StepDecision(step_summary=step_summary, action=action, args=args, done=done)
+
+    def evaluate_with_kev_guardrails(
+        self,
+        user_task: str,
+        decision: StepDecision,
+        history: list[dict[str, Any]],
+        model_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        prompt_payload = {
+            "task": user_task,
+            "history_tail": history[-6:],
+            "proposed_decision": {
+                "step_summary": decision.step_summary,
+                "action": decision.action,
+                "args": decision.args,
+                "done": decision.done,
+            },
+        }
+
+        payload = {
+            "model": model_name or self.model,
+            "max_tokens": 450,
+            "stream": False,
+            "system": KEV_GUARDRAIL_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False)}],
+        }
+
+        response = requests.post(
+            f"{self.worker_base_url}/chat",
+            json=payload,
+            timeout=90,
+        )
+        response.raise_for_status()
+        response_text = self._extract_text_from_anthropic_response(response.json())
+        result = self._extract_json_object(response_text)
+        allow = bool(result.get("allow", False))
+        reason = str(result.get("reason", "")).strip() or "no reason provided"
+        safe_action = result.get("safe_action")
+        safe_args = result.get("safe_args")
+        if safe_action is not None:
+            safe_action = str(safe_action).strip()
+        if not isinstance(safe_args, dict):
+            safe_args = {}
+        return {
+            "allow": allow,
+            "reason": reason,
+            "safe_action": safe_action,
+            "safe_args": safe_args,
+        }
 
     @staticmethod
     def _extract_text_from_anthropic_response(response_json: dict[str, Any]) -> str:
@@ -634,7 +729,7 @@ class AgenticCursorRunner:
         return ParsedPoint(spoken_text=spoken_text, point=(x, y), label=label)
 
 
-class AutonomousAgentRunner:
+class LangGraphAutonomousAgentRunner:
     def __init__(
         self,
         claude_client: ClaudeWorkerClient,
@@ -642,91 +737,203 @@ class AutonomousAgentRunner:
         workspace_root: Path,
         run_artifacts_directory: Path,
         max_steps: int,
+        planner_model: str,
+        kev_model: str,
     ) -> None:
         self.claude_client = claude_client
         self.task = task
         self.workspace_root = workspace_root
         self.max_steps = max_steps
+        self.planner_model = planner_model
+        self.kev_model = kev_model
         self.tools = LocalActionTools(workspace_root=workspace_root)
-        self.history: list[dict[str, Any]] = []
 
         timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
         self.run_directory = run_artifacts_directory / f"run-{timestamp}"
         self.run_directory.mkdir(parents=True, exist_ok=True)
         self.log_file_path = self.run_directory / "steps.jsonl"
+        self.graph = self._build_graph()
 
     def run(self) -> None:
         print(f"Autonomous run directory: {self.run_directory}")
         print(f"Workspace root: {self.workspace_root}")
+        initial_state: AutonomousGraphState = {
+            "task": self.task,
+            "history": [],
+            "current_step_index": 0,
+            "max_steps": self.max_steps,
+            "halt": False,
+        }
+        final_state = self.graph.invoke(initial_state)
 
-        for step_index in range(1, self.max_steps + 1):
-            screenshot_before, width_before, height_before = ScreenshotService.capture_screen()
-            before_screenshot_path = self.run_directory / f"step-{step_index:02d}-before.png"
-            if screenshot_before is not None:
-                before_screenshot_path.write_bytes(screenshot_before)
+        if final_state.get("halt"):
+            print("Autonomous run completed or halted.")
+        else:
+            print("Autonomous run exited without halt flag.")
 
-            try:
-                decision = self.claude_client.ask_for_autonomous_step(
-                    user_task=self.task,
-                    step_index=step_index,
-                    history=self.history,
-                    screenshot_bytes=screenshot_before,
-                    screenshot_width=width_before,
-                    screenshot_height=height_before,
-                )
-            except Exception as error:
-                self._record_step(
-                    step_index=step_index,
-                    decision=None,
-                    success=False,
-                    result={"error": f"decision_failed: {error}"},
-                    before_screenshot_path=before_screenshot_path if screenshot_before is not None else None,
-                    after_screenshot_path=None,
-                )
-                print(f"Step {step_index}: decision error: {error}")
-                continue
+    def _build_graph(self):
+        graph_builder = StateGraph(AutonomousGraphState)
+        graph_builder.add_node("planner", self._planner_node)
+        graph_builder.add_node("kev_guardrail", self._kev_guardrail_node)
+        graph_builder.add_node("executor", self._executor_node)
 
-            print(f"Step {step_index}: {decision.action} | {decision.step_summary}")
+        graph_builder.add_edge(START, "planner")
+        graph_builder.add_edge("planner", "kev_guardrail")
+        graph_builder.add_edge("kev_guardrail", "executor")
+        graph_builder.add_conditional_edges(
+            "executor",
+            self._route_after_executor,
+            {"continue": "planner", "stop": END},
+        )
 
-            action_success = True
-            action_result: dict[str, Any]
-            try:
-                action_result = self.tools.execute(decision.action, decision.args)
-            except Exception as error:
-                action_success = False
-                action_result = {"error": str(error)}
+        return graph_builder.compile()
 
-            screenshot_after, _, _ = ScreenshotService.capture_screen()
-            after_screenshot_path = self.run_directory / f"step-{step_index:02d}-after.png"
-            if screenshot_after is not None:
-                after_screenshot_path.write_bytes(screenshot_after)
+    def _planner_node(self, state: AutonomousGraphState) -> AutonomousGraphState:
+        next_step_index = int(state.get("current_step_index", 0)) + 1
+        if next_step_index > self.max_steps:
+            return {"current_step_index": next_step_index, "halt": True}
 
-            self._record_step(
-                step_index=step_index,
-                decision=decision,
-                success=action_success,
-                result=action_result,
-                before_screenshot_path=before_screenshot_path if screenshot_before is not None else None,
-                after_screenshot_path=after_screenshot_path if screenshot_after is not None else None,
+        history = list(state.get("history", []))
+        screenshot_before, width_before, height_before = ScreenshotService.capture_screen()
+        before_screenshot_path = self.run_directory / f"step-{next_step_index:02d}-before.png"
+        if screenshot_before is not None:
+            before_screenshot_path.write_bytes(screenshot_before)
+
+        try:
+            decision = self.claude_client.ask_for_autonomous_step(
+                user_task=self.task,
+                step_index=next_step_index,
+                history=history,
+                screenshot_bytes=screenshot_before,
+                screenshot_width=width_before,
+                screenshot_height=height_before,
+                model_name=self.planner_model,
+            )
+            print(f"Step {next_step_index}: {decision.action} | {decision.step_summary}")
+        except Exception as error:
+            decision = StepDecision(
+                step_summary=f"planner error: {error}",
+                action="finish",
+                args={"message": f"planner failed at step {next_step_index}: {error}"},
+                done=True,
             )
 
-            if action_success:
-                print(f"Step {step_index}: success")
-            else:
-                print(f"Step {step_index}: failed -> {action_result.get('error')}")
+        return {
+            "current_step_index": next_step_index,
+            "latest_decision": decision,
+            "before_screenshot_bytes": screenshot_before,
+            "before_screenshot_width": width_before,
+            "before_screenshot_height": height_before,
+            "before_screenshot_path": str(before_screenshot_path) if screenshot_before is not None else None,
+        }
 
-            if decision.action == "finish" and action_success:
-                print("Autonomous run completed.")
-                return
+    def _kev_guardrail_node(self, state: AutonomousGraphState) -> AutonomousGraphState:
+        decision = state.get("latest_decision")
+        if decision is None:
+            return {}
 
-            if decision.done and action_success:
-                print("Autonomous run stopped because model marked done=true.")
-                return
+        history = list(state.get("history", []))
+        try:
+            guardrail_result = self.claude_client.evaluate_with_kev_guardrails(
+                user_task=self.task,
+                decision=decision,
+                history=history,
+                model_name=self.kev_model,
+            )
+        except Exception as error:
+            guardrail_result = {
+                "allow": True,
+                "reason": f"guardrail unavailable: {error}",
+                "safe_action": None,
+                "safe_args": {},
+            }
 
-        print("Autonomous run reached max steps before finishing.")
+        if guardrail_result["allow"]:
+            return {}
+
+        safe_action = guardrail_result.get("safe_action")
+        safe_args = guardrail_result.get("safe_args") or {}
+        if safe_action:
+            safe_decision = StepDecision(
+                step_summary=f"kev override: {guardrail_result['reason']}",
+                action=safe_action,
+                args=safe_args,
+                done=False,
+            )
+        else:
+            safe_decision = StepDecision(
+                step_summary=f"kev blocked action: {guardrail_result['reason']}",
+                action="finish",
+                args={"message": f"Blocked by kev guardrail: {guardrail_result['reason']}"},
+                done=True,
+            )
+        return {"latest_decision": safe_decision}
+
+    def _executor_node(self, state: AutonomousGraphState) -> AutonomousGraphState:
+        step_index = int(state.get("current_step_index", 0))
+        history = list(state.get("history", []))
+        decision = state.get("latest_decision")
+        before_screenshot_path_value = state.get("before_screenshot_path")
+        before_screenshot_path = Path(before_screenshot_path_value) if before_screenshot_path_value else None
+
+        if decision is None:
+            self._record_step(
+                history=history,
+                step_index=step_index,
+                decision=None,
+                success=False,
+                result={"error": "missing decision"},
+                before_screenshot_path=before_screenshot_path,
+                after_screenshot_path=None,
+            )
+            return {"history": history, "halt": step_index >= self.max_steps}
+
+        action_success = True
+        try:
+            action_result = self.tools.execute(decision.action, decision.args)
+        except Exception as error:
+            action_success = False
+            action_result = {"error": str(error)}
+
+        screenshot_after, _, _ = ScreenshotService.capture_screen()
+        after_screenshot_path = self.run_directory / f"step-{step_index:02d}-after.png"
+        if screenshot_after is not None:
+            after_screenshot_path.write_bytes(screenshot_after)
+
+        self._record_step(
+            history=history,
+            step_index=step_index,
+            decision=decision,
+            success=action_success,
+            result=action_result,
+            before_screenshot_path=before_screenshot_path,
+            after_screenshot_path=after_screenshot_path if screenshot_after is not None else None,
+        )
+
+        if action_success:
+            print(f"Step {step_index}: success")
+        else:
+            print(f"Step {step_index}: failed -> {action_result.get('error')}")
+
+        should_halt = bool(
+            (decision.action == "finish" and action_success)
+            or (decision.done and action_success)
+            or step_index >= self.max_steps
+        )
+        if should_halt and step_index >= self.max_steps and decision.action != "finish":
+            print("Autonomous run reached max steps before finish action.")
+
+        return {"history": history, "halt": should_halt}
+
+    @staticmethod
+    def _route_after_executor(state: AutonomousGraphState) -> str:
+        if state.get("halt"):
+            return "stop"
+        return "continue"
 
     def _record_step(
         self,
+        history: list[dict[str, Any]],
         step_index: int,
         decision: Optional[StepDecision],
         success: bool,
@@ -748,13 +955,18 @@ class AutonomousAgentRunner:
             "after_screenshot": str(after_screenshot_path) if after_screenshot_path else None,
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }
-        self.history.append(history_entry)
+        history.append(history_entry)
 
         with self.log_file_path.open("a", encoding="utf-8") as log_file:
             log_file.write(json.dumps(history_entry, ensure_ascii=False) + "\n")
 
 
 def run_interactive_mode(args: argparse.Namespace) -> None:
+    if keyboard is None:
+        raise RuntimeError(
+            f"Interactive mode requires X11 input backend. pynput unavailable: {PYNPUT_IMPORT_ERROR}"
+        )
+
     overlay: Optional[OverlayCursor]
     try:
         overlay = OverlayCursor()
@@ -812,12 +1024,17 @@ def run_autonomous_mode(args: argparse.Namespace) -> None:
     workspace_root = Path(args.workspace_dir).expanduser().resolve()
     run_artifacts_directory = Path(args.run_artifacts_dir).expanduser().resolve()
 
-    AutonomousAgentRunner(
+    planner_model_name = args.planner_model or args.model
+    kev_model_name = args.kev_model or args.model
+
+    LangGraphAutonomousAgentRunner(
         claude_client=claude_client,
         task=args.task,
         workspace_root=workspace_root,
         run_artifacts_directory=run_artifacts_directory,
         max_steps=args.max_steps,
+        planner_model=planner_model_name,
+        kev_model=kev_model_name,
     ).run()
 
 
@@ -838,6 +1055,16 @@ def main() -> None:
         "--model",
         default="claude-sonnet-4-6",
         help="Claude model passed through /chat",
+    )
+    parser.add_argument(
+        "--planner-model",
+        default="",
+        help="Model override for the planning node (autonomous mode)",
+    )
+    parser.add_argument(
+        "--kev-model",
+        default="",
+        help="Model override for KEV system-first guardrails (autonomous mode)",
     )
     parser.add_argument(
         "--hotkey",

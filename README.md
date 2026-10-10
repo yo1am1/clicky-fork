@@ -163,7 +163,7 @@ This fork includes a small standalone Linux prototype at:
 
 `/home/runner/work/clicky-fork/clicky-fork/linux-agentic-cursor-mvp`
 
-It intentionally keeps scope tight: single-screen capture, global hotkey trigger, existing Worker `/chat` usage, `[POINT:x,y:label]` parsing, and lightweight overlay cursor animation. Wayland and full voice parity are deferred.
+It intentionally keeps scope tight: single-screen capture, global hotkey trigger, existing Worker `/chat` usage, `[POINT:x,y:label]` parsing, and lightweight overlay cursor animation. It also includes an autonomous multi-step mode built with LangGraph (planner -> KEV guardrail -> execute loop) with per-step screenshots and logs. Wayland and full voice parity are deferred.
 
 ## Contributing
 

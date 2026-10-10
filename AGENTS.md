@@ -77,7 +77,7 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `WindowPositionManager.swift` | ~262 | Window placement logic, Screen Recording permission flow, and accessibility permission helpers. |
 | `AppBundleConfiguration.swift` | ~28 | Runtime configuration reader for keys stored in the app bundle Info.plist. |
 | `worker/src/index.ts` | ~142 | Cloudflare Worker proxy. Three routes: `/chat` (Claude), `/tts` (ElevenLabs), `/transcribe-token` (AssemblyAI temp token). |
-| `linux-agentic-cursor-mvp/agentic_cursor.py` | ~350 | Standalone Linux X11 MVP. Global hotkey trigger + single-screen capture + Worker `/chat` call + `[POINT:x,y:label]` parsing + lightweight overlay cursor fly-to-point and return animation. |
+| `linux-agentic-cursor-mvp/agentic_cursor.py` | ~1000 | Standalone Linux X11 MVP. Includes interactive cursor mode plus LangGraph autonomous mode (plan → KEV guardrail → execute) with per-step screenshots, JSONL logs, and local file/image automation tools. |
 
 ## Build & Run
 
