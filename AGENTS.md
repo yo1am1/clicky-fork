@@ -9,6 +9,8 @@ macOS menu bar companion app. Lives entirely in the macOS status bar (no dock ic
 
 All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in the app.
 
+This fork also includes a separate Linux X11 MVP prototype (`linux-agentic-cursor-mvp/`) that reuses the Worker `/chat` route and Clicky-style `[POINT:x,y:label]` tags for lightweight cursor animation.
+
 ## Architecture
 
 - **App Type**: Menu bar-only (`LSUIElement=true`), no dock icon or main window
@@ -75,6 +77,7 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `WindowPositionManager.swift` | ~262 | Window placement logic, Screen Recording permission flow, and accessibility permission helpers. |
 | `AppBundleConfiguration.swift` | ~28 | Runtime configuration reader for keys stored in the app bundle Info.plist. |
 | `worker/src/index.ts` | ~142 | Cloudflare Worker proxy. Three routes: `/chat` (Claude), `/tts` (ElevenLabs), `/transcribe-token` (AssemblyAI temp token). |
+| `linux-agentic-cursor-mvp/agentic_cursor.py` | ~350 | Standalone Linux X11 MVP. Global hotkey trigger + single-screen capture + Worker `/chat` call + `[POINT:x,y:label]` parsing + lightweight overlay cursor fly-to-point and return animation. |
 
 ## Build & Run
 

@@ -152,8 +152,18 @@ leanring-buddy/          # Swift source (yes, the typo stays)
   BuddyDictation*.swift     # Push-to-talk pipeline
 worker/                  # Cloudflare Worker proxy
   src/index.ts              # Three routes: /chat, /tts, /transcribe-token
+linux-agentic-cursor-mvp/ # Linux X11 MVP for Clicky-style point animations
+  agentic_cursor.py         # Hotkey -> screenshot -> Claude -> [POINT] overlay flow
 CLAUDE.md                # Full architecture doc (agents read this)
 ```
+
+## Linux X11 MVP (in this fork)
+
+This fork includes a small standalone Linux prototype at:
+
+`/home/runner/work/clicky-fork/clicky-fork/linux-agentic-cursor-mvp`
+
+It intentionally keeps scope tight: single-screen capture, global hotkey trigger, existing Worker `/chat` usage, `[POINT:x,y:label]` parsing, and lightweight overlay cursor animation. Wayland and full voice parity are deferred.
 
 ## Contributing
 
